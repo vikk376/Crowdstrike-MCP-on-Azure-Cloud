@@ -1,0 +1,157 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "description": "Deploys the CrowdStrike Falcon MCP server (falcon-mcp) as an Azure Container App in streamable-http mode, ready to connect to Copilot Studio. Provisions a Log Analytics workspace, a Container Apps managed environment, and the Container App."
+  },
+  "parameters": {
+    "falconClientId": {
+      "type": "string",
+      "metadata": { "description": "REQUIRED. CrowdStrike API client ID. Used by the MCP server to authenticate to the Falcon API." }
+    },
+    "falconClientSecret": {
+      "type": "securestring",
+      "metadata": { "description": "REQUIRED. CrowdStrike API client secret." }
+    },
+    "falconBaseUrl": {
+      "type": "string",
+      "defaultValue": "https://api.crowdstrike.com",
+      "allowedValues": [
+        "https://api.crowdstrike.com",
+        "https://api.us-2.crowdstrike.com",
+        "https://api.eu-1.crowdstrike.com",
+        "https://api.laggar.gcw.crowdstrike.com"
+      ],
+      "metadata": { "description": "REQUIRED. Falcon API base URL matching YOUR tenant region. US-1=api.crowdstrike.com, US-2=api.us-2.crowdstrike.com, EU-1=api.eu-1.crowdstrike.com, GovCloud=laggar.gcw." }
+    },
+    "mcpApiKey": {
+      "type": "securestring",
+      "metadata": { "description": "REQUIRED. Self-generated secret that gates access to the MCP HTTP endpoint. This is the credential Copilot Studio presents. Separate from the Falcon API credentials. Generate with: openssl rand -hex 32" }
+    },
+    "falconMcpModules": {
+      "type": "string",
+      "defaultValue": "detections,incidents,intel,hosts",
+      "metadata": { "description": "Comma-separated list of falcon-mcp modules to enable. Leave default or adjust to least privilege." }
+    },
+    "containerImage": {
+      "type": "string",
+      "defaultValue": "quay.io/crowdstrike/falcon-mcp:latest",
+      "metadata": { "description": "Container image. Defaults to the official CrowdStrike image." }
+    },
+    "containerAppName": {
+      "type": "string",
+      "defaultValue": "ca-falcon-mcp",
+      "metadata": { "description": "Name of the Container App." }
+    },
+    "environmentName": {
+      "type": "string",
+      "defaultValue": "cae-falcon-mcp",
+      "metadata": { "description": "Name of the Container Apps managed environment." }
+    },
+    "logAnalyticsName": {
+      "type": "string",
+      "defaultValue": "law-falcon-mcp",
+      "metadata": { "description": "Name of the Log Analytics workspace." }
+    },
+    "location": {
+      "type": "string",
+      "defaultValue": "[resourceGroup().location]",
+      "metadata": { "description": "Azure region for all resources." }
+    },
+    "minReplicas": {
+      "type": "int",
+      "defaultValue": 1,
+      "metadata": { "description": "Minimum replica count." }
+    },
+    "maxReplicas": {
+      "type": "int",
+      "defaultValue": 3,
+      "metadata": { "description": "Maximum replica count. Stateless HTTP is enabled so >1 is safe." }
+    }
+  },
+  "variables": { "targetPort": 8000 },
+  "resources": [
+    {
+      "type": "Microsoft.OperationalInsights/workspaces",
+      "apiVersion": "2023-09-01",
+      "name": "[parameters('logAnalyticsName')]",
+      "location": "[parameters('location')]",
+      "properties": { "sku": { "name": "PerGB2018" }, "retentionInDays": 30 }
+    },
+    {
+      "type": "Microsoft.App/managedEnvironments",
+      "apiVersion": "2024-03-01",
+      "name": "[parameters('environmentName')]",
+      "location": "[parameters('location')]",
+      "dependsOn": [ "[resourceId('Microsoft.OperationalInsights/workspaces', parameters('logAnalyticsName'))]" ],
+      "properties": {
+        "appLogsConfiguration": {
+          "destination": "log-analytics",
+          "logAnalyticsConfiguration": {
+            "customerId": "[reference(resourceId('Microsoft.OperationalInsights/workspaces', parameters('logAnalyticsName')), '2023-09-01').customerId]",
+            "sharedKey": "[listKeys(resourceId('Microsoft.OperationalInsights/workspaces', parameters('logAnalyticsName')), '2023-09-01').primarySharedKey]"
+          }
+        }
+      }
+    },
+    {
+      "type": "Microsoft.App/containerApps",
+      "apiVersion": "2024-03-01",
+      "name": "[parameters('containerAppName')]",
+      "location": "[parameters('location')]",
+      "dependsOn": [ "[resourceId('Microsoft.App/managedEnvironments', parameters('environmentName'))]" ],
+      "properties": {
+        "managedEnvironmentId": "[resourceId('Microsoft.App/managedEnvironments', parameters('environmentName'))]",
+        "configuration": {
+          "activeRevisionsMode": "Single",
+          "ingress": {
+            "external": true,
+            "targetPort": "[variables('targetPort')]",
+            "transport": "http",
+            "allowInsecure": false,
+            "traffic": [ { "weight": 100, "latestRevision": true } ]
+          },
+          "secrets": [
+            { "name": "falcon-client-id", "value": "[parameters('falconClientId')]" },
+            { "name": "falcon-client-secret", "value": "[parameters('falconClientSecret')]" },
+            { "name": "mcp-api-key", "value": "[parameters('mcpApiKey')]" }
+          ]
+        },
+        "template": {
+          "containers": [
+            {
+              "name": "falcon-mcp",
+              "image": "[parameters('containerImage')]",
+              "resources": { "cpu": "[json('0.5')]", "memory": "1Gi" },
+              "env": [
+                { "name": "FALCON_CLIENT_ID", "secretRef": "falcon-client-id" },
+                { "name": "FALCON_CLIENT_SECRET", "secretRef": "falcon-client-secret" },
+                { "name": "FALCON_BASE_URL", "value": "[parameters('falconBaseUrl')]" },
+                { "name": "FALCON_MCP_TRANSPORT", "value": "streamable-http" },
+                { "name": "FALCON_MCP_HOST", "value": "0.0.0.0" },
+                { "name": "FALCON_MCP_PORT", "value": "8000" },
+                { "name": "FALCON_MCP_STATELESS_HTTP", "value": "true" },
+                { "name": "FALCON_MCP_API_KEY", "secretRef": "mcp-api-key" },
+                { "name": "FALCON_MCP_MODULES", "value": "[parameters('falconMcpModules')]" }
+              ]
+            }
+          ],
+          "scale": {
+            "minReplicas": "[parameters('minReplicas')]",
+            "maxReplicas": "[parameters('maxReplicas')]"
+          }
+        }
+      }
+    }
+  ],
+  "outputs": {
+    "fqdn": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.App/containerApps', parameters('containerAppName')), '2024-03-01').configuration.ingress.fqdn]"
+    },
+    "mcpServerUrl": {
+      "type": "string",
+      "value": "[concat('https://', reference(resourceId('Microsoft.App/containerApps', parameters('containerAppName')), '2024-03-01').configuration.ingress.fqdn, '/mcp')]"
+    }
+  }
+}
